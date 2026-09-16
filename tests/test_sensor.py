@@ -9,7 +9,7 @@ from custom_components.librus_apix.__init__ import LibrusApiClient
 def mock_client():
     client = MagicMock(spec=LibrusApiClient)
     client.async_authenticate = AsyncMock(return_value=True)
-    client.async_get_student_info = AsyncMock()
+    client.async_get_student_information = AsyncMock()
     client.async_get_grades = AsyncMock()
     client.async_get_messages = AsyncMock(return_value=[])
     client.async_get_homework = AsyncMock(return_value=[])
@@ -40,7 +40,7 @@ async def test_update_missing_grades(coordinator, mock_client):
     student_info = MagicMock()
     student_info.name = "Jan Kowalski"
     student_info.class_name = "1A"
-    mock_client.async_get_student_info.return_value = student_info
+    mock_client.async_get_student_information.return_value = student_info
     
     # Upewnijmy sie ze koordynator ma puste dane
     coordinator.data = None
@@ -66,9 +66,32 @@ async def test_student_info_getattr_fix(coordinator, mock_client):
             self.class_name = "2B"
     
     student_info = FakeStudentInformation("Piotr Nowak")
-    mock_client.async_get_student_info.return_value = student_info
+    mock_client.async_get_student_information.return_value = student_info
     
     result = await coordinator._async_update_data()
     
     assert result["student_info"].name == "Piotr Nowak"
     # To potwierdza ze wywolania getattr(student_info, 'name') wewnatrz integracji nie zglosza AttributeError
+
+
+@pytest.mark.asyncio
+async def test_update_zerowka_account(coordinator, mock_client):
+    """Test czy konto zerowki (brak ocen, brak student_info) poprawnie sie aktualizuje."""
+    mock_client.async_get_student_information.return_value = None
+    mock_client.async_get_grades.return_value = []
+    mock_client.async_get_messages.return_value = [
+        {"author": "Nauczyciel", "title": "Wycieczka", "date": "2026-09-16", "href": "msg1", "unread": True, "has_attachment": False}
+    ]
+    mock_client.async_get_homework.return_value = []
+    mock_client.async_get_schedule.return_value = []
+    mock_client.async_get_timetable.return_value = []
+    mock_client.async_get_attendance.return_value = []
+    mock_client.async_get_announcements.return_value = []
+
+    coordinator.data = None
+    result = await coordinator._async_update_data()
+
+    assert result["student_info"] is None
+    assert result["oceny"] == []
+    assert len(result["wiadomosci"]) == 1
+    assert result["wiadomosci"][0]["tytul"] == "Wycieczka"

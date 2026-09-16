@@ -56,22 +56,29 @@ class LibrusApiClient:
         self.options = options or {}
         self._client: Client = None
         self._token = None
+        self._last_auth_time: float = 0.0
         self._auth_lock = asyncio.Lock()
 
     def _reset_auth(self) -> None:
         """Reset authentication state to force re-authentication on next call."""
         self._client = None
         self._token = None
+        self._last_auth_time = 0.0
 
     async def async_authenticate(self):
         """Authenticate with Librus API."""
+        import time
         async with self._auth_lock:
+            # If authenticated very recently, reuse current session
+            if self._client and self._token and (time.monotonic() - self._last_auth_time < 10):
+                return True
             try:
                 loop = asyncio.get_running_loop()
                 self._client = await loop.run_in_executor(None, new_client)
                 self._token = await loop.run_in_executor(
                     None, self._client.get_token, self.username, self.password
                 )
+                self._last_auth_time = time.monotonic()
                 _LOGGER.debug("Authentication successful for %s", self.username)
                 return True
             except Exception as ex:
@@ -81,19 +88,23 @@ class LibrusApiClient:
 
     async def async_get_grades(self):
         """Get grades from Librus."""
+        import time
         for attempt in range(2):
             try:
                 if not self._client or not self._token:
                     if not await self.async_authenticate():
-                        return None
+                        return []
                 client = self._client
 
                 from librus_apix.grades import get_grades
 
                 loop = asyncio.get_running_loop()
-                numeric_grades, average_grades, descriptive_grades = await loop.run_in_executor(
+                grades_result = await loop.run_in_executor(
                     None, get_grades, client, "all"
                 )
+                if not grades_result:
+                    return []
+                numeric_grades, average_grades, descriptive_grades = grades_result
 
                 current_sem = _current_semester()
                 _LOGGER.debug("Filtrowanie ocen dla semestru %d", current_sem)
@@ -102,68 +113,75 @@ class LibrusApiClient:
                 all_grades = []
 
                 # Process numeric grades (only current semester)
-                for subject_grades in numeric_grades:
-                    for subject, grades_list in subject_grades.items():
-                        for grade in grades_list:
-                            if grade.semester != current_sem:
-                                continue
-                            all_grades.append({
-                                'subject': subject,
-                                'grade': grade.grade,
-                                'date': grade.date,
-                                'category': grade.category,
-                                'teacher': getattr(grade, 'teacher', ''),
-                                'semester': grade.semester,
-                                'type': 'numeric'
-                            })
-
-                # Process descriptive grades (only current semester, many are actually numeric)
-                for subject_grades in descriptive_grades:
-                    for subject, grades_list in subject_grades.items():
-                        for desc_grade in grades_list:
-                            if desc_grade.semester != current_sem:
-                                continue
-                            grade_val = desc_grade.grade.strip()
-                            if grade_val and (grade_val.replace('+', '').replace('-', '').isdigit() or
-                                            grade_val in ['1', '2', '3', '4', '5', '6', '1+', '1-', '2+', '2-',
-                                                         '3+', '3-', '4+', '4-', '5+', '5-', '6+', '6-']):
+                if numeric_grades:
+                    for subject_grades in numeric_grades:
+                        for subject, grades_list in subject_grades.items():
+                            for grade in grades_list:
+                                if getattr(grade, "semester", None) != current_sem:
+                                    continue
                                 all_grades.append({
                                     'subject': subject,
-                                    'grade': desc_grade.grade,
-                                    'date': desc_grade.date,
-                                    'category': getattr(desc_grade, 'desc', '').split('\n')[0] if hasattr(desc_grade, 'desc') else '',
-                                    'teacher': getattr(desc_grade, 'teacher', ''),
-                                    'semester': desc_grade.semester,
-                                    'type': 'descriptive'
+                                    'grade': getattr(grade, 'grade', ''),
+                                    'date': getattr(grade, 'date', ''),
+                                    'category': getattr(grade, 'category', ''),
+                                    'teacher': getattr(grade, 'teacher', ''),
+                                    'semester': getattr(grade, 'semester', None),
+                                    'type': 'numeric'
                                 })
+
+                # Process descriptive grades (only current semester, many are actually numeric)
+                if descriptive_grades:
+                    for subject_grades in descriptive_grades:
+                        for subject, grades_list in subject_grades.items():
+                            for desc_grade in grades_list:
+                                if getattr(desc_grade, "semester", None) != current_sem:
+                                    continue
+                                grade_val = desc_grade.grade.strip() if hasattr(desc_grade, 'grade') and desc_grade.grade else ''
+                                if grade_val and (grade_val.replace('+', '').replace('-', '').isdigit() or
+                                                grade_val in ['1', '2', '3', '4', '5', '6', '1+', '1-', '2+', '2-',
+                                                             '3+', '3-', '4+', '4-', '5+', '5-', '6+', '6-']):
+                                    all_grades.append({
+                                        'subject': subject,
+                                        'grade': desc_grade.grade,
+                                        'date': getattr(desc_grade, 'date', ''),
+                                        'category': getattr(desc_grade, 'desc', '').split('\n')[0] if hasattr(desc_grade, 'desc') else '',
+                                        'teacher': getattr(desc_grade, 'teacher', ''),
+                                        'semester': getattr(desc_grade, 'semester', None),
+                                        'type': 'descriptive'
+                                    })
 
                 return all_grades
 
             except TokenError as ex:
-                _LOGGER.debug(
-                    "Token expired fetching grades (attempt %d/2), re-authenticating...",
-                    attempt + 1,
-                )
-                self._reset_auth()
-                if attempt == 1:
-                    _LOGGER.error("Failed to get grades after re-authentication.")
-                    return None
+                if attempt == 0 and (time.monotonic() - self._last_auth_time > 30):
+                    _LOGGER.debug(
+                        "Token expired fetching grades (attempt 1/2), re-authenticating..."
+                    )
+                    self._reset_auth()
+                else:
+                    _LOGGER.debug(
+                        "Brak dostepu do modulu ocen (np. konto przedszkolaka / zerowki): %s",
+                        ex,
+                    )
+                    return []
             except Exception as ex:
-                _LOGGER.error(
-                    "Failed to get grades (attempt %d/2): %s\n%s",
-                    attempt + 1, ex, traceback.format_exc(),
+                if type(ex).__name__ == "ParseError":
+                    return []
+                _LOGGER.warning(
+                    "Failed to get grades (attempt %d/2): %s",
+                    attempt + 1, ex,
                 )
-                self._reset_auth()
                 if attempt == 1:
-                    return None
+                    return []
 
     async def async_get_messages(self, count: int = 10):
         """Get latest messages from Librus (subject and sender only, no content fetch to avoid marking as read)."""
+        import time
         for attempt in range(2):
             try:
                 if not self._client or not self._token:
                     if not await self.async_authenticate():
-                        return None
+                        return []
                 client = self._client
 
                 from librus_apix.messages import get_received, message_content
@@ -177,14 +195,14 @@ class LibrusApiClient:
                 result = []
                 for msg in messages:
                     msg_dict = {
-                        "author": msg.author,
-                        "title": msg.title,
-                        "date": msg.date,
-                        "href": msg.href,
-                        "unread": msg.unread,
-                        "has_attachment": msg.has_attachment,
+                        "author": getattr(msg, "author", ""),
+                        "title": getattr(msg, "title", ""),
+                        "date": getattr(msg, "date", ""),
+                        "href": getattr(msg, "href", ""),
+                        "unread": getattr(msg, "unread", False),
+                        "has_attachment": getattr(msg, "has_attachment", False),
                     }
-                    if fetch_content:
+                    if fetch_content and msg_dict["href"]:
                         try:
                             msg_data = await loop.run_in_executor(None, message_content, client, msg.href)
                             content_str = msg_data.content if hasattr(msg_data, 'content') else str(msg_data)
@@ -198,30 +216,32 @@ class LibrusApiClient:
                 return result
 
             except TokenError as ex:
-                _LOGGER.debug(
-                    "Token expired fetching messages (attempt %d/2), re-authenticating...",
-                    attempt + 1,
-                )
-                self._reset_auth()
-                if attempt == 1:
-                    _LOGGER.error("Failed to get messages after re-authentication.")
-                    return None
+                if attempt == 0 and (time.monotonic() - self._last_auth_time > 30):
+                    _LOGGER.debug(
+                        "Token expired fetching messages (attempt 1/2), re-authenticating..."
+                    )
+                    self._reset_auth()
+                else:
+                    _LOGGER.debug("Brak dostepu do wiadomosci: %s", ex)
+                    return []
             except Exception as ex:
-                _LOGGER.error(
-                    "Failed to get messages (attempt %d/2): %s\n%s",
-                    attempt + 1, ex, traceback.format_exc(),
+                if type(ex).__name__ == "ParseError":
+                    return []
+                _LOGGER.warning(
+                    "Failed to get messages (attempt %d/2): %s",
+                    attempt + 1, ex,
                 )
-                self._reset_auth()
                 if attempt == 1:
-                    return None
+                    return []
 
     async def async_get_homework(self):
         """Get upcoming homework assignments from Librus (next 30 days)."""
+        import time
         for attempt in range(2):
             try:
                 if not self._client or not self._token:
                     if not await self.async_authenticate():
-                        return None
+                        return []
 
                 from librus_apix.homework import get_homework
                 from datetime import date as _date, timedelta
@@ -231,39 +251,41 @@ class LibrusApiClient:
                 date_to = (today + timedelta(days=30)).strftime("%Y-%m-%d")
 
                 loop = asyncio.get_running_loop()
-                return await loop.run_in_executor(
+                hw = await loop.run_in_executor(
                     None, get_homework, self._client, date_from, date_to
                 )
+                return hw if hw is not None else []
 
-            except TokenError:
-                _LOGGER.debug(
-                    "Token expired fetching homework (attempt %d/2), re-authenticating...",
-                    attempt + 1,
-                )
-                self._reset_auth()
-                if attempt == 1:
-                    _LOGGER.error("Failed to get homework after re-authentication.")
-                    return None
+            except TokenError as ex:
+                if attempt == 0 and (time.monotonic() - self._last_auth_time > 30):
+                    _LOGGER.debug(
+                        "Token expired fetching homework (attempt 1/2), re-authenticating..."
+                    )
+                    self._reset_auth()
+                else:
+                    _LOGGER.debug("Brak dostepu do modulu zadan domowych (np. zerowka): %s", ex)
+                    return []
             except Exception as ex:
-                _LOGGER.error(
-                    "Failed to get homework (attempt %d/2): %s\n%s",
-                    attempt + 1, ex, traceback.format_exc(),
+                if type(ex).__name__ == "ParseError":
+                    return []
+                _LOGGER.warning(
+                    "Failed to get homework (attempt %d/2): %s",
+                    attempt + 1, ex,
                 )
-                self._reset_auth()
                 if attempt == 1:
-                    return None
+                    return []
 
     async def async_get_schedule(self):
         """Get upcoming calendar events from Librus (current + next month, filtered to future dates)."""
+        import time
         for attempt in range(2):
             try:
                 if not self._client or not self._token:
                     if not await self.async_authenticate():
-                        return None
+                        return []
 
                 from librus_apix.schedule import get_schedule
                 from datetime import date as _date
-                import calendar
 
                 today = _date.today()
                 loop = asyncio.get_running_loop()
@@ -278,8 +300,13 @@ class LibrusApiClient:
                         ),
                     ]:
                         monthly = get_schedule(self._client, str(month).zfill(2), str(year))
+                        if not monthly:
+                            continue
                         for day_num, day_events in monthly.items():
-                            event_date = _date(year, month, int(day_num))
+                            try:
+                                event_date = _date(year, month, int(day_num))
+                            except ValueError:
+                                continue
                             if event_date < today:
                                 continue
                             dni = ["Poniedziałek", "Wtorek", "Środa", "Czwartek", "Piątek", "Sobota", "Niedziela"]
@@ -287,42 +314,45 @@ class LibrusApiClient:
                                 events.append({
                                     "data": event_date.strftime("%Y-%m-%d"),
                                     "tydzien": dni[event_date.weekday()],
-                                    "tytul": ev.title,
-                                    "przedmiot": ev.subject,
-                                    "godzina": ev.hour,
-                                    "numer_lekcji": ev.number,
-                                    "szczegoly": ev.data,
-                                    "href": ev.href,
+                                    "tytul": getattr(ev, "title", ""),
+                                    "przedmiot": getattr(ev, "subject", ""),
+                                    "godzina": getattr(ev, "hour", ""),
+                                    "numer_lekcji": getattr(ev, "number", ""),
+                                    "szczegoly": getattr(ev, "data", ""),
+                                    "href": getattr(ev, "href", ""),
                                 })
                     return sorted(events, key=lambda e: e["data"])
 
-                return await loop.run_in_executor(None, _fetch_two_months)
+                result = await loop.run_in_executor(None, _fetch_two_months)
+                return result if result is not None else []
 
-            except TokenError:
-                _LOGGER.debug(
-                    "Token expired fetching schedule (attempt %d/2), re-authenticating...",
-                    attempt + 1,
-                )
-                self._reset_auth()
-                if attempt == 1:
-                    _LOGGER.error("Failed to get schedule after re-authentication.")
-                    return None
+            except TokenError as ex:
+                if attempt == 0 and (time.monotonic() - self._last_auth_time > 30):
+                    _LOGGER.debug(
+                        "Token expired fetching schedule (attempt 1/2), re-authenticating..."
+                    )
+                    self._reset_auth()
+                else:
+                    _LOGGER.debug("Brak dostepu do terminarza (np. zerowka): %s", ex)
+                    return []
             except Exception as ex:
-                _LOGGER.error(
-                    "Failed to get schedule (attempt %d/2): %s\n%s",
-                    attempt + 1, ex, traceback.format_exc(),
+                if type(ex).__name__ == "ParseError":
+                    return []
+                _LOGGER.warning(
+                    "Failed to get schedule (attempt %d/2): %s",
+                    attempt + 1, ex,
                 )
-                self._reset_auth()
                 if attempt == 1:
-                    return None
+                    return []
 
     async def async_get_timetable(self):
         """Get timetable (plan lekcji) from Librus."""
+        import time
         for attempt in range(2):
             try:
                 if not self._client or not self._token:
                     if not await self.async_authenticate():
-                        return None
+                        return []
                 client = self._client
 
                 from librus_apix.timetable import get_timetable
@@ -337,30 +367,29 @@ class LibrusApiClient:
                 def _fetch_two_weeks():
                     tt1 = get_timetable(client, datetime.combine(monday, datetime.min.time()))
                     tt2 = get_timetable(client, datetime.combine(next_monday, datetime.min.time()))
-                    return tt1 + tt2
+                    return (tt1 or []) + (tt2 or [])
                     
                 timetable = await loop.run_in_executor(None, _fetch_two_weeks)
+                if not timetable:
+                    return []
 
                 result = []
                 dni_nazwy = ["Poniedziałek", "Wtorek", "Środa", "Czwartek", "Piątek", "Sobota", "Niedziela"]
                 
-                # We have 14 days starting from 'monday'
-                # We want 7 days starting from 'today'
-                # 'today' is at index 'today.weekday()'
                 start_idx = today.weekday()
                 
-                for i in range(start_idx, start_idx + 7):
+                for i in range(start_idx, min(start_idx + 7, len(timetable))):
                     day = timetable[i]
                     day_date = (monday + timedelta(days=i)).strftime("%Y-%m-%d")
                     dzien_tyg = dni_nazwy[i % 7]
                     
                     day_list = []
                     for period in day:
-                        if period.subject:
+                        if getattr(period, "subject", None):
                             subject = period.subject
-                            teacher_and_classroom = period.teacher_and_classroom
+                            teacher_and_classroom = getattr(period, "teacher_and_classroom", "")
 
-                            if period.info:
+                            if getattr(period, "info", None):
                                 for info_val in period.info.values():
                                     if isinstance(info_val, dict):
                                         subject = subject.strip().replace("\n", " ")
@@ -404,10 +433,10 @@ class LibrusApiClient:
                             day_list.append({
                                 "przedmiot": subject,
                                 "nauczyciel_i_sala": teacher_and_classroom,
-                                "godzina_od": period.date_from,
-                                "godzina_do": period.date_to,
-                                "data": period.date or day_date,
-                                "numer": period.number,
+                                "godzina_od": getattr(period, "date_from", ""),
+                                "godzina_do": getattr(period, "date_to", ""),
+                                "data": getattr(period, "date", "") or day_date,
+                                "numer": getattr(period, "number", 0),
                             })
                     result.append({
                         "dzien_tygodnia": dzien_tyg,
@@ -417,29 +446,29 @@ class LibrusApiClient:
 
                 return result
 
-            except TokenError:
-                _LOGGER.debug(
-                    "Token expired fetching timetable (attempt %d/2), re-authenticating...",
-                    attempt + 1,
-                )
-                self._reset_auth()
-                if attempt == 1:
-                    _LOGGER.error("Failed to get timetable after re-authentication.")
-                    return None
+            except TokenError as ex:
+                if attempt == 0 and (time.monotonic() - self._last_auth_time > 30):
+                    _LOGGER.debug(
+                        "Token expired fetching timetable (attempt 1/2), re-authenticating..."
+                    )
+                    self._reset_auth()
+                else:
+                    _LOGGER.debug("Brak dostepu do planu lekcji (np. zerowka / wakacje): %s", ex)
+                    return []
             except Exception as ex:
                 if type(ex).__name__ == "ParseError":
                     _LOGGER.info("Brak planu lekcji w tym tygodniu (wakacje/brak danych). Zwracam pusty plan.")
                     return []
-                _LOGGER.error(
-                    "Failed to get timetable (attempt %d/2): %s\n%s",
-                    attempt + 1, ex, traceback.format_exc(),
+                _LOGGER.warning(
+                    "Failed to get timetable (attempt %d/2): %s",
+                    attempt + 1, ex,
                 )
-                self._reset_auth()
                 if attempt == 1:
-                    return None
+                    return []
 
     async def async_get_student_information(self):
         """Get student information from Librus."""
+        import time
         for attempt in range(2):
             try:
                 if not self._client or not self._token:
@@ -451,31 +480,36 @@ class LibrusApiClient:
                 loop = asyncio.get_running_loop()
                 return await loop.run_in_executor(None, get_student_information, self._client)
 
-            except TokenError:
-                _LOGGER.debug(
-                    "Token expired fetching student information (attempt %d/2), re-authenticating...",
-                    attempt + 1,
-                )
-                self._reset_auth()
-                if attempt == 1:
-                    _LOGGER.error("Failed to get student information after re-authentication.")
+            except TokenError as ex:
+                if attempt == 0 and (time.monotonic() - self._last_auth_time > 30):
+                    _LOGGER.debug(
+                        "Token expired fetching student information (attempt 1/2), re-authenticating..."
+                    )
+                    self._reset_auth()
+                else:
+                    _LOGGER.debug(
+                        "Brak dostepu do informacji o uczniu / szczesliwym numerku (np. zerowka): %s",
+                        ex,
+                    )
                     return None
             except Exception as ex:
-                _LOGGER.error(
-                    "Failed to get student information (attempt %d/2): %s\n%s",
-                    attempt + 1, ex, traceback.format_exc(),
+                if type(ex).__name__ == "ParseError":
+                    return None
+                _LOGGER.warning(
+                    "Failed to get student information (attempt %d/2): %s",
+                    attempt + 1, ex,
                 )
-                self._reset_auth()
                 if attempt == 1:
                     return None
 
     async def async_get_attendance(self):
         """Get attendance from Librus."""
+        import time
         for attempt in range(2):
             try:
                 if not self._client or not self._token:
                     if not await self.async_authenticate():
-                        return None
+                        return []
 
                 from librus_apix.attendance import get_attendance
                 loop = asyncio.get_running_loop()
@@ -494,26 +528,28 @@ class LibrusApiClient:
                                 "godzina": getattr(a, "period", 0)
                             })
                 return result
-            except TokenError:
-                _LOGGER.debug("Token expired fetching attendance (attempt %d/2), re-authenticating...", attempt + 1)
-                self._reset_auth()
-                if attempt == 1:
-                    return None
+            except TokenError as ex:
+                if attempt == 0 and (time.monotonic() - self._last_auth_time > 30):
+                    _LOGGER.debug("Token expired fetching attendance (attempt 1/2), re-authenticating...")
+                    self._reset_auth()
+                else:
+                    _LOGGER.debug("Brak dostepu do frekwencji (np. zerowka): %s", ex)
+                    return []
             except Exception as ex:
                 if type(ex).__name__ == "ParseError":
                     return []
-                _LOGGER.error("Failed to get attendance (attempt %d/2): %s", attempt + 1, ex)
-                self._reset_auth()
+                _LOGGER.warning("Failed to get attendance (attempt %d/2): %s", attempt + 1, ex)
                 if attempt == 1:
-                    return None
+                    return []
 
     async def async_get_announcements(self):
         """Get announcements from Librus."""
+        import time
         for attempt in range(2):
             try:
                 if not self._client or not self._token:
                     if not await self.async_authenticate():
-                        return None
+                        return []
 
                 from librus_apix.announcements import get_announcements
                 loop = asyncio.get_running_loop()
@@ -529,18 +565,19 @@ class LibrusApiClient:
                             "data": getattr(a, "date", "")
                         })
                 return result
-            except TokenError:
-                _LOGGER.debug("Token expired fetching announcements (attempt %d/2), re-authenticating...", attempt + 1)
-                self._reset_auth()
-                if attempt == 1:
-                    return None
+            except TokenError as ex:
+                if attempt == 0 and (time.monotonic() - self._last_auth_time > 30):
+                    _LOGGER.debug("Token expired fetching announcements (attempt 1/2), re-authenticating...")
+                    self._reset_auth()
+                else:
+                    _LOGGER.debug("Brak dostepu do ogloszen: %s", ex)
+                    return []
             except Exception as ex:
                 if type(ex).__name__ == "ParseError":
                     return []
-                _LOGGER.error("Failed to get announcements (attempt %d/2): %s", attempt + 1, ex)
-                self._reset_auth()
+                _LOGGER.warning("Failed to get announcements (attempt %d/2): %s", attempt + 1, ex)
                 if attempt == 1:
-                    return None
+                    return []
 
 
 async def async_setup(hass: HomeAssistant, config: Dict[str, Any]) -> bool:

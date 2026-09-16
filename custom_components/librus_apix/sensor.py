@@ -321,7 +321,9 @@ def _device_info(coordinator: DataUpdateCoordinator, config_entry: ConfigEntry) 
     """Zwroc informacje o urzadzeniu."""
     data = coordinator.data or {}
     student_info = data.get("student_info")
-    name = student_info.name if student_info else "Librus"
+    name = getattr(student_info, "name", None) if student_info else None
+    if not name:
+        name = config_entry.data.get("username", "Synergia")
     return {
         "identifiers": {(DOMAIN, config_entry.entry_id)},
         "name": f"Librus - {name}",
@@ -349,7 +351,7 @@ class LibrusUczenSensor(CoordinatorEntity, SensorEntity):
     @property
     def native_value(self) -> Optional[str]:
         info = (self.coordinator.data or {}).get("student_info")
-        return info.name if info else None
+        return getattr(info, "name", None) if info else self._config_entry.data.get("username", "Uczeń")
 
     @property
     def extra_state_attributes(self) -> Dict[str, Any]:
@@ -357,11 +359,11 @@ class LibrusUczenSensor(CoordinatorEntity, SensorEntity):
         if not info:
             return {}
         return {
-            "klasa": info.class_name,
-            "numer_w_klasie": info.number,
-            "wychowawca": info.tutor,
-            "szkola": info.school,
-            "szczesliwy_numerek": info.lucky_number,
+            "klasa": getattr(info, "class_name", ""),
+            "numer_w_klasie": getattr(info, "number", ""),
+            "wychowawca": getattr(info, "tutor", ""),
+            "szkola": getattr(info, "school", ""),
+            "szczesliwy_numerek": getattr(info, "lucky_number", ""),
         }
 
 
@@ -384,7 +386,7 @@ class LibrusSzczesliwyNumerekSensor(CoordinatorEntity, SensorEntity):
     @property
     def native_value(self) -> Any:
         info = (self.coordinator.data or {}).get("student_info")
-        return info.lucky_number if info else None
+        return getattr(info, "lucky_number", None) if info else None
 
 
 class LibrusOcenySensor(CoordinatorEntity, SensorEntity):
