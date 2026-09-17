@@ -78,6 +78,16 @@ class LibrusApiClient:
                 self._token = await loop.run_in_executor(
                     None, self._client.get_token, self.username, self.password
                 )
+                api_key = getattr(self._token, "API_Key", None)
+                if not self._token or not api_key or "None" in str(api_key) or not str(api_key).strip():
+                    _LOGGER.error(
+                        "Authentication failed for %s: received invalid or empty session token from Librus (API_Key=%s).",
+                        self.username,
+                        repr(api_key),
+                    )
+                    self._reset_auth()
+                    return False
+
                 self._last_auth_time = time.monotonic()
                 _LOGGER.debug("Authentication successful for %s", self.username)
                 return True
